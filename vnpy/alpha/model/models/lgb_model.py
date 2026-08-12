@@ -21,6 +21,7 @@ class LgbModel(AlphaModel):
         early_stopping_rounds: int = 50,
         log_evaluation_period: int = 1,
         seed: int | None = None,
+        boosting: str = "gbdt",
         objective: str = "mse"
     ):
         """
@@ -38,6 +39,11 @@ class LgbModel(AlphaModel):
             Interval rounds for printing training logs
         seed : int | None
             Random seed
+        boosting : str
+            "gbdt" (默认) 或 "dart" (Dropout GBDT, 每轮随机丢弃部分已建树缓解过拟合)。
+            ⚠️ dart 下 `early_stopping` 回调官方声明失效 ("has no effect", 因验证曲线
+            被随机 dropout 震荡而非单调收敛) -> fit() 自动跳过 early_stopping 回调,
+            必须用固定轮数训练 + 事后选优 (见 docs/gbdt_dart_experiment_plan.md)。
         objective : str
             "mse" (默认, 点式回归) 或 "lambdarank" (排序学习,
             按交易日构造 query group, label 自动 5 档整数分箱, ndcg@10 早停)
@@ -46,8 +52,17 @@ class LgbModel(AlphaModel):
             "objective": objective,
             "learning_rate": learning_rate,
             "num_leaves": num_leaves,
+            "boosting": boosting,
             "seed": seed
         }
+        if boosting == "dart":
+            # DART 推荐超参 (调研: LightGBM 官方参数 + 排序任务调参建议, 见排期文档 §2.4)
+            self.params.update({
+                "drop_rate": 0.1,
+                "max_drop": 50,
+                "skip_drop": 0.6,
+                "uniform_drop": False,
+            })
         if objective == "lambdarank":
             # NDCG 截断级别与 eval 指标对齐 (top-10 排序质量)
             self.params["lambdarank_truncation_level"] = 10
@@ -112,16 +127,17 @@ class LgbModel(AlphaModel):
         ds: list[lgb.Dataset] = self._prepare_data(dataset)
 
         # Execute model training
+        callbacks = [lgb.log_evaluation(self.log_evaluation_period)]  # Logging callback
+        if self.params.get("boosting") != "dart":
+            # dart 下 early_stopping 官方失效 (验证曲线被 dropout 震荡, 非单调收敛)
+            callbacks.insert(0, lgb.early_stopping(self.early_stopping_rounds))
         self.model = lgb.train(
             self.params,
             ds[0],
             num_boost_round=self.num_boost_round,
             valid_sets=ds,
             valid_names=["train", "valid"],
-            callbacks=[
-                lgb.early_stopping(self.early_stopping_rounds),      # Early stopping callback
-                lgb.log_evaluation(self.log_evaluation_period)       # Logging callback
-            ]
+            callbacks=callbacks
         )
 
     def predict(self, dataset: AlphaDataset, segment: Segment) -> np.ndarray:

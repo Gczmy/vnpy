@@ -21,6 +21,7 @@ class XgbModel(AlphaModel):
         log_evaluation_period: int = 1,
         seed: int | None = None,
         colsample_bytree: float = 1.0,
+        booster: str = "gbtree",
         objective: str = "reg:squarederror"
     ):
         """
@@ -44,6 +45,11 @@ class XgbModel(AlphaModel):
         colsample_bytree : float
             (0, 1] 每棵树随机采样的特征比例。默认 1.0 (全特征, 确定性); 3-seed 协议
             建议 0.9: 特征采样不影响 query group, 是 ranking 任务唯一安全的随机源。
+        booster : str
+            "gbtree" (默认) 或 "dart" (Dropout GBDT, 继承 gbtree 全部参数, 每轮随机
+            丢弃部分树缓解过拟合)。dart 下训练有随机性、早停不稳定 -> fit() 传
+            early_stopping_rounds=None, 用固定轮数 + 事后 iteration_range 选优
+            (见 docs/gbdt_dart_experiment_plan.md)。
         objective : str
             "reg:squarederror" (默认, 点式回归) 或 "rank:ndcg" (LambdaMART 排序学习,
             按交易日构造 query group, label 自动 5 档整数分箱, ndcg@10 早停)
@@ -52,9 +58,18 @@ class XgbModel(AlphaModel):
             "objective": objective,
             "eta": learning_rate,
             "max_depth": max_depth,
+            "booster": booster,
             "seed": seed,
             "colsample_bytree": colsample_bytree,
         }
+        if booster == "dart":
+            # DART 推荐超参 (调研: XGBoost DART 教程参数建议, 见排期文档 §2.4)
+            self.params.update({
+                "rate_drop": 0.1,
+                "skip_drop": 0.5,
+                "sample_type": "uniform",
+                "normalize_type": "tree",
+            })
         if objective == "rank:ndcg":
             self.params["eval_metric"] = "ndcg@10"
 
@@ -94,7 +109,9 @@ class XgbModel(AlphaModel):
             ds[0],
             num_boost_round=self.num_boost_round,
             evals=[(ds[0], "train"), (ds[1], "valid")],
-            early_stopping_rounds=self.early_stopping_rounds,
+            # dart 下早停不稳定 (训练有随机性, 验证曲线震荡) -> 固定轮数训练
+            early_stopping_rounds=None if self.params.get("booster") == "dart"
+            else self.early_stopping_rounds,
             verbose_eval=self.log_evaluation_period,
         )
 
@@ -111,11 +128,14 @@ class XgbModel(AlphaModel):
         data = df.select(df.columns[2: -1]).to_pandas()
         dtest = xgb.DMatrix(data)
 
-        # 用早停最优迭代数 (best_iteration), 避免尾部过拟合轮次
-        if self.model.best_iteration:
+        # 用早停最优迭代数 (best_iteration), 避免尾部过拟合轮次。
+        # ⚠️ XGBoost 的 best_iteration 是 property: 未用早停时访问抛 AttributeError
+        # (dart 模式下 early_stopping_rounds=None) -> getattr 捕获后走全模型预测。
+        best_iter = getattr(self.model, "best_iteration", None)
+        if best_iter:
             result = cast(
                 np.ndarray,
-                self.model.predict(dtest, iteration_range=(0, self.model.best_iteration + 1)),
+                self.model.predict(dtest, iteration_range=(0, best_iter + 1)),
             )
         else:
             result = cast(np.ndarray, self.model.predict(dtest))

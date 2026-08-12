@@ -20,6 +20,7 @@ class XgbModel(AlphaModel):
         early_stopping_rounds: int = 50,
         log_evaluation_period: int = 1,
         seed: int | None = None,
+        colsample_bytree: float = 1.0,
         objective: str = "reg:squarederror"
     ):
         """
@@ -36,7 +37,13 @@ class XgbModel(AlphaModel):
         log_evaluation_period : int
             Interval rounds for printing training logs
         seed : int | None
-            Random seed
+            Random seed. ⚠️ 仅当同时引入随机源 (如 colsample_bytree<1) 时才产生 seed 方差:
+            XGBoost 默认 gbtree + 全特征确定性地贪心分裂, 仅设 seed 不改变结果
+            (2026-08-12 实测: 三个 "seed" 信号 md5 完全一致, 见 extended_oos_2026.md §24⑤)。
+            注意: 不能用 subsample 做随机源——按行采样会破坏 ranking 的 query group 结构。
+        colsample_bytree : float
+            (0, 1] 每棵树随机采样的特征比例。默认 1.0 (全特征, 确定性); 3-seed 协议
+            建议 0.9: 特征采样不影响 query group, 是 ranking 任务唯一安全的随机源。
         objective : str
             "reg:squarederror" (默认, 点式回归) 或 "rank:ndcg" (LambdaMART 排序学习,
             按交易日构造 query group, label 自动 5 档整数分箱, ndcg@10 早停)
@@ -46,6 +53,7 @@ class XgbModel(AlphaModel):
             "eta": learning_rate,
             "max_depth": max_depth,
             "seed": seed,
+            "colsample_bytree": colsample_bytree,
         }
         if objective == "rank:ndcg":
             self.params["eval_metric"] = "ndcg@10"

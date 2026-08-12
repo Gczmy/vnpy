@@ -346,6 +346,61 @@ class AlphaLab:
 
         return component_filters
 
+    def load_universe(self) -> dict:
+        """Load universe definition from lab/universe.json (crypto / custom markets).
+
+        Format:
+            {
+              "symbols": ["BTCUSDT.BINANCE", ...],
+              "listing_dates": {"BTCUSDT.BINANCE": "2017-08-17", ...}
+            }
+        Returns {} if file does not exist.
+        """
+        file_path: Path = self.lab_path.joinpath("universe.json")
+        if not file_path.exists():
+            return {}
+
+        with open(file_path, encoding="UTF-8") as f:
+            return json.load(f)
+
+    def load_universe_symbols(
+        self,
+        start: datetime | str,
+        end: datetime | str
+    ) -> list[str]:
+        """Collect universe symbols (crypto market, no index component shelve)"""
+        universe: dict = self.load_universe()
+        return list(universe.get("symbols", []))
+
+    def load_universe_filters(
+        self,
+        start: datetime | str,
+        end: datetime | str
+    ) -> dict[str, list[tuple[datetime, datetime]]]:
+        """Collect universe duration filters: each symbol valid from its listing date.
+
+        Symbols without an explicit listing date are assumed valid for the whole
+        requested range (min of range start and data start).
+        """
+        universe: dict = self.load_universe()
+        start_dt: datetime = to_datetime(start)
+        end_dt: datetime = to_datetime(end)
+        listing_dates: dict = universe.get("listing_dates", {})
+
+        filters: dict[str, list[tuple[datetime, datetime]]] = {}
+        for vt_symbol in universe.get("symbols", []):
+            listed_str: str | None = listing_dates.get(vt_symbol)
+            if listed_str:
+                listed_dt: datetime = to_datetime(listed_str)
+            else:
+                listed_dt = start_dt
+
+            eff_start: datetime = max(start_dt, listed_dt)
+            if eff_start <= end_dt:
+                filters[vt_symbol] = [(eff_start, end_dt)]
+
+        return filters
+
     def add_contract_setting(
         self,
         vt_symbol: str,

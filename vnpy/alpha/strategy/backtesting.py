@@ -10,13 +10,38 @@ import plotly.graph_objects as go               # type: ignore
 from plotly.subplots import make_subplots       # type: ignore
 from tqdm import tqdm
 
-from vnpy.trader.constant import Direction, Offset, Interval, Status
+from vnpy.trader.constant import Direction, Offset, Interval, Status, Exchange
 from vnpy.trader.object import OrderData, TradeData, BarData
 from vnpy.trader.utility import round_to, extract_vt_symbol
 
 from ..logger import logger
 from ..lab import AlphaLab
 from .template import AlphaStrategy
+
+
+# ================= A股交易现实约束 (与券商/交易所规则一致) =================
+# 印花税: 2023-08-28 起由千1 减半为万5 (单边卖出)
+STAMP_TAX_HALVING_DATE = date(2023, 8, 28)
+STAMP_TAX_AFTER_HALVING = 0.0005
+# 创业板注册制: 2020-08-24 起涨跌幅 10% -> 20%
+CYB_20PCT_DATE = datetime(2020, 8, 24)
+# 有涨跌停的交易所 (A股); 加密货币 24h 连续交易无涨跌停
+A_SHARE_EXCHANGES = {Exchange.SSE, Exchange.SZSE, Exchange.BSE}
+
+
+def _effective_stamp_rate(
+    long_rate: float,
+    short_rate: float,
+    dt: datetime | date | None,
+    stamp_halving: bool = True,
+) -> float:
+    """有效印花税率: 2023-08-28 起为万5, 此前为 contract 里 short_rate - long_rate (千1)。"""
+    rate: float = short_rate - long_rate
+    if rate > 0 and stamp_halving and dt is not None:
+        d: date = dt.date() if isinstance(dt, datetime) else dt
+        if d >= STAMP_TAX_HALVING_DATE:
+            rate = min(rate, STAMP_TAX_AFTER_HALVING)
+    return rate
 
 
 class BacktestingEngine:
@@ -67,6 +92,17 @@ class BacktestingEngine:
         self.cash: float = 0
         self.signal_df: pl.DataFrame
 
+        self.slippage: float = 0.0005    # 滑点比例 (默认万5 = 现实默认; 0=无)
+        self.min_commission: float = 5.0  # 单笔最低佣金 (默认 5 元 = 现实券商; 0=无下限)
+
+        # 现实约束开关 (默认全开 = A股现实; 供 A/B 实验诊断用)
+        self.use_price_limits: bool = True   # 涨跌停限制 (板块/日期感知)
+        self.block_zero_volume: bool = True  # 停牌/无量日不成交
+        self.stamp_tax_halving: bool = True  # 2023-08-28 起印花税减半为万5
+
+        self.stamp_tax: float = 0         # 印花税累计 (卖出额 × 有效印花税率)
+        self.slippage_cost: float = 0     # 滑点成本累计 (滑点前后价差 × 量 × 乘数)
+
     def set_parameters(
         self,
         vt_symbols: list[str],
@@ -75,9 +111,19 @@ class BacktestingEngine:
         end: datetime,
         capital: int = 1_000_000,
         risk_free: float = 0,
-        annual_days: int = 240
+        annual_days: int = 240,
+        slippage: float = 0.0005,
+        min_commission: float = 5.0,
+        use_price_limits: bool = True,
+        block_zero_volume: bool = True,
+        stamp_tax_halving: bool = True
     ) -> None:
-        """Set parameters"""
+        """Set parameters
+
+        ⚠️ 默认按 A股现实成本与约束: 滑点万5 + 最低佣金 5 元/笔 + 涨跌停 + 停牌不成交
+        + 印花税 2023-08-28 起减半。
+        零成本 (滑点=0, 最低佣金=0) 或关闭约束需显式传参, 零成本会在统计时输出警告。
+        """
         self.vt_symbols = vt_symbols
         self.interval = interval
 
@@ -86,6 +132,11 @@ class BacktestingEngine:
         self.capital = capital
         self.risk_free = risk_free
         self.annual_days = annual_days
+        self.slippage = slippage
+        self.min_commission = min_commission
+        self.use_price_limits = use_price_limits
+        self.block_zero_volume = block_zero_volume
+        self.stamp_tax_halving = stamp_tax_halving
 
         self.cash = capital
 
@@ -172,16 +223,15 @@ class BacktestingEngine:
         logger.info("开始计算逐日盯市盈亏")
 
         if not self.trades:
-            logger.info("成交记录为空，无法计算")
-            return None
+            logger.info("成交记录为空，仅计算持仓盈亏")
+        else:
+            for trade in self.trades.values():
+                if not trade.datetime:
+                    continue
 
-        for trade in self.trades.values():
-            if not trade.datetime:
-                continue
-
-            d: date = trade.datetime.date()
-            daily_result: PortfolioDailyResult = self.daily_results[d]
-            daily_result.add_trade(trade)
+                d: date = trade.datetime.date()
+                daily_result: PortfolioDailyResult = self.daily_results[d]
+                daily_result.add_trade(trade)
 
         pre_closes: dict[str, float] = {}
         start_poses: dict[str, float] = {}
@@ -192,7 +242,9 @@ class BacktestingEngine:
                 start_poses,
                 self.sizes,
                 self.long_rates,
-                self.short_rates
+                self.short_rates,
+                self.min_commission,
+                self.stamp_tax_halving
             )
 
             pre_closes = daily_result.close_prices
@@ -229,6 +281,10 @@ class BacktestingEngine:
         """Calculate strategy statistics"""
         logger.info("开始计算策略统计指标")
 
+        # 零成本警示: 与现实不符, 不允许作为默认口径
+        if self.slippage <= 0 and self.min_commission <= 0:
+            logger.warning("⚠️ 零成本回测 (滑点=0 且最低佣金=0), 结果与现实不符, 仅用于对照实验!")
+
         # Initialize statistics
         start_date: str = ""
         end_date: str = ""
@@ -247,6 +303,7 @@ class BacktestingEngine:
         daily_turnover: float = 0
         total_trade_count: int = 0
         daily_trade_count: float = 0
+        daily_turnover_rate: float = 0
         total_return: float = 0
         annual_return: float = 0
         daily_return: float = 0
@@ -319,6 +376,10 @@ class BacktestingEngine:
             total_trade_count = cast(int, df["trade_count"].sum())
             daily_trade_count = total_trade_count / total_days
 
+            # 日均换手率 = 日均成交金额 / 平均持仓市值 (近似用平均净值)
+            avg_balance = (self.capital + end_balance) / 2
+            daily_turnover_rate = (daily_turnover / avg_balance * 100) if avg_balance else 0
+
             total_return = (end_balance / self.capital - 1) * 100
             annual_return = total_return / total_days * self.annual_days
             daily_return = cast(float, df["return"].mean()) * 100
@@ -330,7 +391,7 @@ class BacktestingEngine:
             else:
                 sharpe_ratio = 0
 
-            return_drawdown_ratio = -total_net_pnl / max_drawdown
+            return_drawdown_ratio = (-total_net_pnl / max_drawdown) if max_drawdown else 0
 
         # Output results
         logger.info("-" * 30)
@@ -352,6 +413,9 @@ class BacktestingEngine:
 
         logger.info(f"总盈亏：  {total_net_pnl:,.2f}")
         logger.info(f"总手续费：  {total_commission:,.2f}")
+        logger.info(f"  其中佣金：  {total_commission - self.stamp_tax:,.2f}")
+        logger.info(f"  其中印花税：  {self.stamp_tax:,.2f}")
+        logger.info(f"滑点成本：  {self.slippage_cost:,.2f}")
         logger.info(f"总成交金额：  {total_turnover:,.2f}")
         logger.info(f"总成交笔数：  {total_trade_count}")
 
@@ -359,6 +423,9 @@ class BacktestingEngine:
         logger.info(f"日均手续费：  {daily_commission:,.2f}")
         logger.info(f"日均成交金额：  {daily_turnover:,.2f}")
         logger.info(f"日均成交笔数：  {daily_trade_count}")
+        logger.info(f"日均换手率：  {daily_turnover_rate:,.2f}%")
+        logger.info(f"滑点假设：  {self.slippage:.6f}")
+        logger.info(f"最低佣金：  {self.min_commission:.2f} 元/笔")
 
         logger.info(f"日均收益率：  {daily_return:,.2f}%")
         logger.info(f"收益标准差：  {return_std:,.2f}%")
@@ -384,6 +451,12 @@ class BacktestingEngine:
             "daily_turnover": daily_turnover,
             "total_trade_count": total_trade_count,
             "daily_trade_count": daily_trade_count,
+            "daily_turnover_rate": daily_turnover_rate,
+            "slippage": self.slippage,
+            "min_commission": self.min_commission,
+            "total_commission_fee": total_commission - self.stamp_tax,
+            "total_stamp_tax": self.stamp_tax,
+            "total_slippage_cost": self.slippage_cost,
             "total_return": total_return,
             "annual_return": annual_return,
             "daily_return": daily_return,
@@ -616,10 +689,33 @@ class BacktestingEngine:
 
         self.update_daily_close(self.bars, dt)
 
+    def _uses_price_limits(self, vt_symbol: str) -> bool:
+        """是否有涨跌停: A股 (SSE/SZSE) 有; 加密货币 24h 连续交易无"""
+        _, exchange = extract_vt_symbol(vt_symbol)
+        return exchange in A_SHARE_EXCHANGES
+
+    def _limit_ratio(self, vt_symbol: str) -> float:
+        """涨跌幅限制: 科创板 688xx 上市起 20%; 创业板 300/301xx 2020-08-24 起 20%
+        (此前 10%); 主板 10%。ST (±5%) 无法从代码识别, 沪深300 不含 ST, 忽略。"""
+        symbol: str = vt_symbol.split(".")[0]
+        if symbol.startswith(("43", "83", "87", "920")):
+            return 0.30  # 北交所 BSE
+        if symbol.startswith("688"):
+            return 0.20  # 科创板
+        if symbol.startswith(("300", "301")):
+            if self.datetime and self.datetime >= CYB_20PCT_DATE:
+                return 0.20  # 创业板 (2020-08-24 起)
+            return 0.10
+        return 0.10
+
     def cross_order(self) -> None:
         """Match limit orders"""
         for order in list(self.active_limit_orders.values()):
             bar: BarData = self.bars[order.vt_symbol]
+
+            # 停牌/无量日: 当日无成交不可成交 (fill_bar volume=0), 订单继续挂单
+            if self.block_zero_volume and bar.volume <= 0:
+                continue
 
             long_cross_price: float = bar.low_price
             short_cross_price: float = bar.high_price
@@ -631,27 +727,41 @@ class BacktestingEngine:
                 order.status = Status.NOTTRADED
                 self.strategy.update_order(order)
 
-            # Calculate price limits
+            # Calculate price limits (板块/日期感知, A股才启用)
             pricetick: float = self.priceticks[order.vt_symbol]
             pre_close: float = self.pre_closes.get(order.vt_symbol, 0)
 
-            limit_up: float = round_to(pre_close * 1.1, pricetick)
-            limit_down: float = round_to(pre_close * 0.9, pricetick)
-
-            # Check limit orders that can be matched
-            long_cross: bool = (
-                order.direction == Direction.LONG
-                and order.price >= long_cross_price
-                and long_cross_price > 0
-                and bar.low_price < limit_up        # Not a full-day limit-up market
-            )
-
-            short_cross: bool = (
-                order.direction == Direction.SHORT
-                and order.price <= short_cross_price
-                and short_cross_price > 0
-                and bar.high_price > limit_down     # Not a full-day limit-down market
-            )
+            limit_up: float = 0
+            limit_down: float = 0
+            if self.use_price_limits and self._uses_price_limits(order.vt_symbol) and pre_close > 0:
+                ratio: float = self._limit_ratio(order.vt_symbol)
+                limit_up = round_to(pre_close * (1 + ratio), pricetick)
+                limit_down = round_to(pre_close * (1 - ratio), pricetick)
+                # Check limit orders that can be matched
+                long_cross: bool = (
+                    order.direction == Direction.LONG
+                    and order.price >= long_cross_price
+                    and long_cross_price > 0
+                    and bar.low_price < limit_up        # Not a full-day limit-up market
+                )
+                short_cross: bool = (
+                    order.direction == Direction.SHORT
+                    and order.price <= short_cross_price
+                    and short_cross_price > 0
+                    and bar.high_price > limit_down     # Not a full-day limit-down market
+                )
+            else:
+                # 无涨跌停市场 (加密货币等) 或首日无昨收: 常规撮合
+                long_cross = (
+                    order.direction == Direction.LONG
+                    and order.price >= long_cross_price
+                    and long_cross_price > 0
+                )
+                short_cross = (
+                    order.direction == Direction.SHORT
+                    and order.price <= short_cross_price
+                    and short_cross_price > 0
+                )
 
             if not long_cross and not short_cross:
                 continue
@@ -672,6 +782,22 @@ class BacktestingEngine:
             else:
                 trade_price = max(order.price, short_best_price)
 
+            # 滑点: 买入价上浮 / 卖出价下浮 (模拟冲击成本), 归整到最小变动价位,
+            # 且不越过当日涨跌停价 (现实约束)
+            if self.slippage > 0:
+                order_size: float = self.sizes[order.vt_symbol]
+                if order.direction == Direction.LONG:
+                    slipped_price: float = round_to(trade_price * (1 + self.slippage), pricetick)
+                    if limit_up > 0:
+                        slipped_price = min(slipped_price, limit_up)
+                    self.slippage_cost += (slipped_price - trade_price) * order.volume * order_size
+                else:
+                    slipped_price = round_to(trade_price * (1 - self.slippage), pricetick)
+                    if limit_down > 0:
+                        slipped_price = max(slipped_price, limit_down)
+                    self.slippage_cost += (trade_price - slipped_price) * order.volume * order_size
+                trade_price = slipped_price
+
             trade: TradeData = TradeData(
                 symbol=order.symbol,
                 exchange=order.exchange,
@@ -690,10 +816,26 @@ class BacktestingEngine:
 
             trade_turnover: float = trade.price * trade.volume * size
 
+            # 有效印花税: 2023-08-28 起减半为万5 (此前千1)
+            stamp: float = _effective_stamp_rate(
+                self.long_rates[trade.vt_symbol],
+                self.short_rates[trade.vt_symbol],
+                self.datetime,
+                self.stamp_tax_halving,
+            )
+
             if trade.direction == Direction.LONG:
-                trade_commission: float = trade_turnover * self.long_rates[trade.vt_symbol]
+                trade_commission: float = max(
+                    trade_turnover * self.long_rates[trade.vt_symbol],
+                    self.min_commission,
+                )
             else:
-                trade_commission = trade_turnover * self.short_rates[trade.vt_symbol]
+                # 卖出 = 佣金(保底) + 印花税(不保底, 单边卖出征收), 与券商实际收费一致
+                trade_commission = max(
+                    trade_turnover * self.long_rates[trade.vt_symbol],
+                    self.min_commission,
+                ) + trade_turnover * stamp
+                self.stamp_tax += trade_turnover * stamp
 
             if trade.direction == Direction.LONG:
                 self.cash -= trade_turnover
@@ -829,9 +971,13 @@ class ContractDailyResult:
         start_pos: float,
         size: float,
         long_rate: float,
-        short_rate: float
+        short_rate: float,
+        min_commission: float = 0,
+        stamp_tax_halving: bool = True
     ) -> None:
         """Calculate profit and loss"""
+        self.stamp_tax_halving = stamp_tax_halving
+
         # If there is no previous close price, use 1 instead to avoid division error
         if pre_close:
             self.pre_close = pre_close
@@ -853,7 +999,7 @@ class ContractDailyResult:
                 rate: float = long_rate
             else:
                 pos_change = -trade.volume
-                rate = short_rate
+                rate = long_rate
 
             self.end_pos += pos_change
 
@@ -861,7 +1007,11 @@ class ContractDailyResult:
 
             self.trading_pnl += pos_change * (self.close_price - trade.price) * size
             self.turnover += turnover
-            self.commission += turnover * rate
+            # 佣金保底 (与 cross_order 现金口径一致); 卖出另加印花税 (2023-08-28 起万5)
+            self.commission += max(turnover * rate, min_commission)
+            if trade.direction == Direction.SHORT:
+                self.commission += turnover * _effective_stamp_rate(
+                    long_rate, short_rate, self.date, self.stamp_tax_halving)
 
         # Calculate daily profit and loss
         self.total_pnl = self.trading_pnl + self.holding_pnl
@@ -907,7 +1057,9 @@ class PortfolioDailyResult:
         start_poses: dict[str, float],
         sizes: dict[str, float],
         long_rates: dict[str, float],
-        short_rates: dict[str, float]
+        short_rates: dict[str, float],
+        min_commission: float = 0,
+        stamp_tax_halving: bool = True
     ) -> None:
         """Calculate profit and loss"""
         self.pre_closes = pre_closes
@@ -919,7 +1071,9 @@ class PortfolioDailyResult:
                 start_poses.get(vt_symbol, 0),
                 sizes[vt_symbol],
                 long_rates[vt_symbol],
-                short_rates[vt_symbol]
+                short_rates[vt_symbol],
+                min_commission,
+                stamp_tax_halving
             )
 
             self.trade_count += contract_result.trade_count

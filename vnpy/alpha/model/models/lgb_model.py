@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 
 from vnpy.alpha.dataset import AlphaDataset, Segment
 from vnpy.alpha.model import AlphaModel
+from vnpy.alpha.model.rank_utils import rank_groups, rank_labels
 
 
 class LgbModel(AlphaModel):
@@ -19,7 +20,8 @@ class LgbModel(AlphaModel):
         num_boost_round: int = 1000,
         early_stopping_rounds: int = 50,
         log_evaluation_period: int = 1,
-        seed: int | None = None
+        seed: int | None = None,
+        objective: str = "mse"
     ):
         """
         Parameters
@@ -36,13 +38,20 @@ class LgbModel(AlphaModel):
             Interval rounds for printing training logs
         seed : int | None
             Random seed
+        objective : str
+            "mse" (默认, 点式回归) 或 "lambdarank" (排序学习,
+            按交易日构造 query group, label 自动 5 档整数分箱, ndcg@10 早停)
         """
         self.params: dict = {
-            "objective": "mse",
+            "objective": objective,
             "learning_rate": learning_rate,
             "num_leaves": num_leaves,
             "seed": seed
         }
+        if objective == "lambdarank":
+            # NDCG 截断级别与 eval 指标对齐 (top-10 排序质量)
+            self.params["lambdarank_truncation_level"] = 10
+            self.params["eval_metric"] = "ndcg@10"
 
         self.num_boost_round: int = num_boost_round
         self.early_stopping_rounds: int = early_stopping_rounds
@@ -76,8 +85,13 @@ class LgbModel(AlphaModel):
             data = df.select(df.columns[2: -1]).to_pandas()
             label = np.array(df["label"])
 
-            # Add training data
-            ds.append(lgb.Dataset(data, label=label))
+            if self.params["objective"] == "lambdarank":
+                # 排序学习: 每日 = 一个 query group, label 转 5 档整数
+                label = rank_labels(df)
+                group = rank_groups(df)
+                ds.append(lgb.Dataset(data, label=label, group=group))
+            else:
+                ds.append(lgb.Dataset(data, label=label))
 
         return ds
 

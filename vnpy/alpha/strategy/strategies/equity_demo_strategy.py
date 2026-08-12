@@ -86,6 +86,11 @@ class EquityDemoStrategy(AlphaStrategy):
 
         # Buy rebalancing
         if buy_symbols:
+            # 剔除当天无行情 (停牌/无数据) 的股票, 避免 KeyError
+            buy_symbols = [s for s in buy_symbols if bars.get(s) is not None]
+            if not buy_symbols:
+                self.execute_trading(bars, price_add=self.price_add)
+                return
             buy_value: float = cash * self.cash_ratio / len(buy_symbols)        # Calculate investment amount per contract
 
             for vt_symbol in buy_symbols:

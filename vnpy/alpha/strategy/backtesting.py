@@ -2,6 +2,7 @@ from collections import defaultdict
 from datetime import date, datetime
 from copy import copy
 from typing import cast
+import json
 import traceback
 
 import numpy as np
@@ -218,8 +219,14 @@ class BacktestingEngine:
 
         logger.info("历史数据回放结束")
 
-    def calculate_result(self) -> pl.DataFrame | None:
-        """Calculate daily mark-to-market profit and loss"""
+    def calculate_result(self, with_positions: bool = False) -> pl.DataFrame | None:
+        """Calculate daily mark-to-market profit and loss
+
+        with_positions=True 时额外输出每日持仓明细列 (funding 叠加层用):
+          - pos_detail: 该日收盘持仓 dict {vt_symbol: 数量}
+          - close_detail: 该日收盘价 dict {vt_symbol: 价格}
+        不改动任何 pnl 计算, 仅在返回 DataFrame 增加两列 (默认关闭, 零回归)。
+        """
         logger.info("开始计算逐日盯市盈亏")
 
         if not self.trades:
@@ -261,7 +268,18 @@ class BacktestingEngine:
             for key in fields:
                 value = getattr(daily_result, key)
                 results[key].append(value)
+            if with_positions:
+                # 持仓明细存 JSON 字符串 (polars 对 dict 列表首项为空时推断 Struct({}) 全空,
+                # 见 funding_overlay 调试; JSON 字符串最可靠)
+                results["pos_detail"].append(
+                    json.dumps({k: v for k, v in daily_result.end_poses.items()
+                                if abs(v) > 1e-12}, ensure_ascii=False))
+                results["close_detail"].append(
+                    json.dumps(dict(daily_result.close_prices), ensure_ascii=False))
 
+        # 初始化 daily_df (防止无交易时未定义)
+        self.daily_df = pl.DataFrame()
+        
         if results:
             self.daily_df = pl.DataFrame([
                 pl.Series("date", results["date"], dtype=pl.Date),
@@ -273,6 +291,11 @@ class BacktestingEngine:
                 pl.Series("total_pnl", results["total_pnl"], dtype=pl.Float64),
                 pl.Series("net_pnl", results["net_pnl"], dtype=pl.Float64),
             ])
+            if with_positions:
+                self.daily_df = self.daily_df.with_columns([
+                    pl.Series("pos_detail", results["pos_detail"]),
+                    pl.Series("close_detail", results["close_detail"]),
+                ])
 
         logger.info("逐日盯市盈亏计算完成")
         return self.daily_df
@@ -815,6 +838,29 @@ class BacktestingEngine:
             size: float = self.sizes[trade.vt_symbol]
 
             trade_turnover: float = trade.price * trade.volume * size
+
+            # B3: 现金校验 — gap-down/超买防护 (方向性偏乐观修正):
+            # 买入现金不足则缩量至可负担 (扣除保底佣金), 连最小单位都买不起则拒单 + 日志。
+            # 策略侧 cash_ratio 缓冲大概率兜住, 此处兜底极端日的小额隐性杠杆。
+            if trade.direction == Direction.LONG and self.cash < trade_turnover:
+                unit_cost: float = trade.price * size
+                affordable: int = int((self.cash - self.min_commission) / unit_cost) if unit_cost > 0 else 0
+                if affordable < 1:
+                    self.write_log(
+                        f"现金不足拒单: {trade.vt_symbol} 需 {trade_turnover + self.min_commission:.2f} "
+                        f"> 现金 {self.cash:.2f}"
+                    )
+                    order.status = Status.REJECTED
+                    self.strategy.update_order(order)
+                    continue
+                if affordable < trade.volume:
+                    self.write_log(
+                        f"现金不足缩量: {trade.vt_symbol} {trade.volume}->{affordable} "
+                        f"(现金 {self.cash:.2f}, 需 {trade_turnover:.2f})"
+                    )
+                    trade.volume = float(affordable)
+                    order.traded = float(affordable)
+                    trade_turnover = trade.price * trade.volume * size
 
             # 有效印花税: 2023-08-28 起减半为万5 (此前千1)
             stamp: float = _effective_stamp_rate(

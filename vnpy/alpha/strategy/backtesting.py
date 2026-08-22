@@ -3,6 +3,7 @@ from datetime import date, datetime
 from copy import copy
 from typing import cast
 import json
+import math
 import traceback
 
 import numpy as np
@@ -115,6 +116,7 @@ class BacktestingEngine:
         annual_days: int = 240,
         slippage: float = 0.0005,
         min_commission: float = 5.0,
+        min_volume: float = 1.0,
         use_price_limits: bool = True,
         block_zero_volume: bool = True,
         stamp_tax_halving: bool = True
@@ -124,6 +126,8 @@ class BacktestingEngine:
         ⚠️ 默认按 A股现实成本与约束: 滑点万5 + 最低佣金 5 元/笔 + 涨跌停 + 停牌不成交
         + 印花税 2023-08-28 起减半。
         零成本 (滑点=0, 最低佣金=0) 或关闭约束需显式传参, 零成本会在统计时输出警告。
+        min_volume: 交易量最小粒度 (S-6, B3 现金不足缩量时 floor 对齐;
+        默认 1.0 保持原 int() 行为, A股传 100 (整手股数), crypto 传 0.001 (币数)。
         """
         self.vt_symbols = vt_symbols
         self.interval = interval
@@ -135,6 +139,7 @@ class BacktestingEngine:
         self.annual_days = annual_days
         self.slippage = slippage
         self.min_commission = min_commission
+        self.min_volume = min_volume
         self.use_price_limits = use_price_limits
         self.block_zero_volume = block_zero_volume
         self.stamp_tax_halving = stamp_tax_halving
@@ -846,10 +851,19 @@ class BacktestingEngine:
             # B3: 现金校验 — gap-down/超买防护 (方向性偏乐观修正):
             # 买入现金不足则缩量至可负担 (扣除保底佣金), 连最小单位都买不起则拒单 + 日志。
             # 策略侧 cash_ratio 缓冲大概率兜住, 此处兜底极端日的小额隐性杠杆。
+            # S-6: 缩量 floor 对齐 min_volume 粒度 (A股 100 股整手 / crypto 0.001 币数),
+            # 原 int() 截断: A股给出非整手股数、crypto 对小数仓位直接归零误拒。
             if trade.direction == Direction.LONG and self.cash < trade_turnover:
                 unit_cost: float = trade.price * size
-                affordable: int = int((self.cash - self.min_commission) / unit_cost) if unit_cost > 0 else 0
-                if affordable < 1:
+                raw_affordable: float = (
+                    (self.cash - self.min_commission) / unit_cost if unit_cost > 0 else 0.0
+                )
+                mv: float = max(self.min_volume, 0.0)
+                affordable: float = (
+                    math.floor(raw_affordable / mv + 1e-9) * mv
+                    if mv > 0 else raw_affordable
+                )
+                if affordable <= 0 or affordable < mv - 1e-9:
                     self.write_log(
                         f"现金不足拒单: {trade.vt_symbol} 需 {trade_turnover + self.min_commission:.2f} "
                         f"> 现金 {self.cash:.2f}"

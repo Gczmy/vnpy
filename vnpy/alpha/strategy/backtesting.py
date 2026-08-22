@@ -340,7 +340,9 @@ class BacktestingEngine:
         # Calculate capital-related metrics
         df: pl.DataFrame = self.daily_df
 
-        if df is not None:
+        # C3: load_data 一无所获时 daily_df 为空 (Null-schema) DataFrame,
+        # with_columns/取列会抛 ColumnNotFoundError, 直接返回空统计
+        if df is not None and not df.is_empty():
             df = df.with_columns(
                 # Strategy capital
                 balance=pl.col("net_pnl").cum_sum() + self.capital
@@ -408,8 +410,10 @@ class BacktestingEngine:
             daily_return = cast(float, df["return"].mean()) * 100
             return_std = cast(float, df["return"].std()) * 100
 
-            if return_std:
-                daily_risk_free = self.risk_free / np.sqrt(self.annual_days)
+            if return_std and self.annual_days > 0:
+                # C2: 年化→日化应除以 annual_days (非平方根); daily_return 已是
+                # 百分数而 risk_free 惯例是小数 (如 0.03 = 3%), 统一 ×100。
+                daily_risk_free = (self.risk_free * 100) / self.annual_days
                 sharpe_ratio = (daily_return - daily_risk_free) / return_std * np.sqrt(self.annual_days)
             else:
                 sharpe_ratio = 0
